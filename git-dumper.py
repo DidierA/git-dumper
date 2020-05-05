@@ -176,49 +176,21 @@ class DownloadWorker(Worker):
         self.session.mount(url, requests.adapters.HTTPAdapter(max_retries=retry))
 
     def do_task(self, filepath, url, directory, retry, timeout):
-        with closing(self.session.get('%s/%s' % (url, filepath),
-                                      allow_redirects=False,
-                                      stream=True,
-                                      timeout=timeout)) as response:
-            printf('[-] Fetching %s/%s [%d]\n', url, filepath, response.status_code)
+        count=0
+        while (count < 5):
+            with closing(self.session.get('%s/%s' % (url, filepath),
+                                        allow_redirects=False,
+                                        stream=True,
+                                        timeout=timeout)) as response:
+                printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
+                count+=1
 
-            if response.status_code != 200:
-                return []
+                if response.status_code == 403:
+                    continue
 
-            abspath = os.path.abspath(os.path.join(directory, filepath))
-            create_intermediate_dirs(abspath)
+                if response.status_code != 200:
+                    return []
 
-            # write file
-            with open(abspath, 'wb') as f:
-                for chunk in response.iter_content(4096):
-                    f.write(chunk)
-
-            return []
-
-
-class RecursiveDownloadWorker(DownloadWorker):
-    ''' Download a directory recursively '''
-
-    def do_task(self, filepath, url, directory, retry, timeout):
-        with closing(self.session.get('%s/%s' % (url, filepath),
-                                      allow_redirects=False,
-                                      stream=True,
-                                      timeout=timeout)) as response:
-            printf('[-] Fetching %s/%s [%d]\n', url, filepath, response.status_code)
-
-            if (response.status_code in (301, 302) and
-                    'Location' in response.headers and
-                    response.headers['Location'].endswith(filepath + '/')):
-                return [filepath + '/']
-
-            if response.status_code != 200:
-                return []
-
-            if filepath.endswith('/'): # directory index
-                assert is_html(response)
-
-                return [filepath + filename for filename in get_indexed_files(response)]
-            else: # file
                 abspath = os.path.abspath(os.path.join(directory, filepath))
                 create_intermediate_dirs(abspath)
 
@@ -228,16 +200,64 @@ class RecursiveDownloadWorker(DownloadWorker):
                         f.write(chunk)
 
                 return []
+        return []
+
+
+class RecursiveDownloadWorker(DownloadWorker):
+    ''' Download a directory recursively '''
+
+    def do_task(self, filepath, url, directory, retry, timeout):
+        count=0
+        while count<5:
+            with closing(self.session.get('%s/%s' % (url, filepath),
+                                        allow_redirects=False,
+                                        stream=True,
+                                        timeout=timeout)) as response:
+                count+=1
+                printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
+
+                if (response.status_code in (301, 302) and
+                        'Location' in response.headers and
+                        response.headers['Location'].endswith(filepath + '/')):
+                    return [filepath + '/']
+
+                if response.status_code == 403:
+                    continue
+
+                if response.status_code != 200:
+                    return []
+
+                if filepath.endswith('/'): # directory index
+                    assert is_html(response)
+
+                    return [filepath + filename for filename in get_indexed_files(response)]
+                else: # file
+                    abspath = os.path.abspath(os.path.join(directory, filepath))
+                    create_intermediate_dirs(abspath)
+
+                    # write file
+                    with open(abspath, 'wb') as f:
+                        for chunk in response.iter_content(4096):
+                            f.write(chunk)
+
+                    return []
+        return []
 
 
 class FindRefsWorker(DownloadWorker):
     ''' Find refs/ '''
 
     def do_task(self, filepath, url, directory, retry, timeout):
-        response = self.session.get('%s/%s' % (url, filepath),
+        count=0
+        while count < 5: # repeat if return code is 403
+            count+=1
+            response = self.session.get('%s/%s' % (url, filepath),
                                     allow_redirects=False,
                                     timeout=timeout)
-        printf('[-] Fetching %s/%s [%d]\n', url, filepath, response.status_code)
+            printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
+
+            if response.status_code != 403:
+                break
 
         if response.status_code != 200:
             return []
@@ -266,10 +286,17 @@ class FindObjectsWorker(DownloadWorker):
 
     def do_task(self, obj, url, directory, retry, timeout):
         filepath = '.git/objects/%s/%s' % (obj[:2], obj[2:])
-        response = self.session.get('%s/%s' % (url, filepath),
+
+        count=0
+        while count < 5: # repeat if return code is 403
+            count+=1
+            response = self.session.get('%s/%s' % (url, filepath),
                                     allow_redirects=False,
                                     timeout=timeout)
-        printf('[-] Fetching %s/%s [%d]\n', url, filepath, response.status_code)
+            printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
+
+            if response.status_code != 403:
+                break
 
         if response.status_code != 200:
             return []
@@ -284,6 +311,19 @@ class FindObjectsWorker(DownloadWorker):
         # parse object file to find other objects
         obj_file = dulwich.objects.ShaFile.from_path(abspath)
         return get_referenced_sha1(obj_file)
+
+
+def url_get(url):
+    count=0
+    while count < 5: # repeat if return code is 403
+        count+=1
+        printf('[-] Testing %s ', url)
+        response = requests.get('%s' % url, verify=False, allow_redirects=False)
+        printf('[%d]\n', response.status_code)
+        if response.status_code != 403:
+            break
+
+    return response
 
 
 def fetch_git(url, directory, jobs, retry, timeout):
@@ -305,9 +345,7 @@ def fetch_git(url, directory, jobs, retry, timeout):
     url = url.rstrip('/')
 
     # check for /.git/HEAD
-    printf('[-] Testing %s/.git/HEAD ', url)
-    response = requests.get('%s/.git/HEAD' % url, verify=False, allow_redirects=False)
-    printf('[%d]\n', response.status_code)
+    response=url_get('%s/.git/HEAD' % url)
 
     if response.status_code != 200:
         printf('error: %s/.git/HEAD does not exist\n', url, file=sys.stderr)
@@ -317,10 +355,8 @@ def fetch_git(url, directory, jobs, retry, timeout):
         return 1
 
     # check for directory listing
-    printf('[-] Testing %s/.git/ ', url)
-    response = requests.get('%s/.git/' % url, verify=False, allow_redirects=False)
-    printf('[%d]\n', response.status_code)
-
+    response=url_get('%s/.git/' % url)
+    
     if response.status_code == 200 and is_html(response) and 'HEAD' in get_indexed_files(response):
         printf('[-] Fetching .git recursively\n')
         process_tasks(['.git/', '.gitignore'],
