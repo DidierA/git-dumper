@@ -17,6 +17,7 @@ import dulwich.objects
 import dulwich.pack
 import requests
 import socks
+import time
 
 
 def printf(fmt, *args, file=sys.stdout):
@@ -176,26 +177,35 @@ class DownloadWorker(Worker):
         self.session.mount(url, requests.adapters.HTTPAdapter(max_retries=retry))
 
     def do_task(self, filepath, url, directory, retry, timeout):
+        # if file already exists, do not download it again
+        abspath = os.path.abspath(os.path.join(directory, filepath))
+        if os.path.exists(abspath):
+            printf('[-] File %s/%s already fetched\n', url, filepath)
+            return []
+
         count=0
-        while (count < 5):
+        while (count < 5): # retry 5 times in case of 403
+            count+=1
             with closing(self.session.get('%s/%s' % (url, filepath),
                                         allow_redirects=False,
                                         stream=True,
                                         timeout=timeout)) as response:
                 printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
-                count+=1
 
                 if response.status_code == 403:
+                    # start a  new session to drop any cookie, close connection, etc
+                    self.init(url, directory, retry, timeout)
+                    time.sleep(10)
                     continue
 
                 if response.status_code != 200:
                     return []
-
-                abspath = os.path.abspath(os.path.join(directory, filepath))
+                
                 create_intermediate_dirs(abspath)
 
                 # write file
                 with open(abspath, 'wb') as f:
+                    # printf('[%d] Writing file %s\n', count, abspath) #debug
                     for chunk in response.iter_content(4096):
                         f.write(chunk)
 
@@ -207,13 +217,20 @@ class RecursiveDownloadWorker(DownloadWorker):
     ''' Download a directory recursively '''
 
     def do_task(self, filepath, url, directory, retry, timeout):
+        abspath = os.path.abspath(os.path.join(directory, filepath))
+
+        # check if it is a file and it already has been fetched
+        if not filepath.endswith('/') and os.path.exists(abspath):
+            printf('[-] File %s/%s already fetched\n', url, filepath)
+            return []
+        
         count=0
         while count<5:
+            count+=1
             with closing(self.session.get('%s/%s' % (url, filepath),
                                         allow_redirects=False,
                                         stream=True,
                                         timeout=timeout)) as response:
-                count+=1
                 printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
 
                 if (response.status_code in (301, 302) and
@@ -222,6 +239,9 @@ class RecursiveDownloadWorker(DownloadWorker):
                     return [filepath + '/']
 
                 if response.status_code == 403:
+                    # start a  new session to drop any cookie, close connection, etc
+                    self.init(url, directory, retry, timeout)
+                    time.sleep(10)
                     continue
 
                 if response.status_code != 200:
@@ -232,7 +252,7 @@ class RecursiveDownloadWorker(DownloadWorker):
 
                     return [filepath + filename for filename in get_indexed_files(response)]
                 else: # file
-                    abspath = os.path.abspath(os.path.join(directory, filepath))
+
                     create_intermediate_dirs(abspath)
 
                     # write file
@@ -248,31 +268,43 @@ class FindRefsWorker(DownloadWorker):
     ''' Find refs/ '''
 
     def do_task(self, filepath, url, directory, retry, timeout):
-        count=0
-        while count < 5: # repeat if return code is 403
-            count+=1
-            response = self.session.get('%s/%s' % (url, filepath),
-                                    allow_redirects=False,
-                                    timeout=timeout)
-            printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
-
-            if response.status_code != 403:
-                break
-
-        if response.status_code != 200:
-            return []
-
         abspath = os.path.abspath(os.path.join(directory, filepath))
-        create_intermediate_dirs(abspath)
+        # check if file already has been fetched
+        if os.path.exists(abspath):
+            printf('[-] File %s/%s already fetched\n', url, filepath)
+            with open(abspath, 'r') as f:
+                response_text=f.read()
+        else:
+            count=0
+            while count < 5: # repeat if return code is 403
+                count+=1
+                response = self.session.get('%s/%s' % (url, filepath),
+                                        allow_redirects=False,
+                                        timeout=timeout)
+                printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
 
-        # write file
-        with open(abspath, 'w') as f:
-            f.write(response.text)
+                if response.status_code == 403:
+                    # start a  new session to drop any cookie, close connection, etc
+                    self.init(url, directory, retry, timeout)
+                    time.sleep(10)
+                    continue
+                else:
+                    break
+
+            if response.status_code != 200:
+                return []
+
+            create_intermediate_dirs(abspath)
+
+            # write file
+            with open(abspath, 'w') as f:
+                f.write(response.text)
+                response_text=response.text
 
         # find refs
         tasks = []
 
-        for ref in re.findall(r'(refs(/[a-zA-Z0-9\-\.\_\*]+)+)', response.text):
+        for ref in re.findall(r'(refs(/[a-zA-Z0-9\-\.\_\*]+)+)', response_text):
             ref = ref[0]
             if not ref.endswith('*'):
                 tasks.append('.git/%s' % ref)
@@ -286,27 +318,35 @@ class FindObjectsWorker(DownloadWorker):
 
     def do_task(self, obj, url, directory, retry, timeout):
         filepath = '.git/objects/%s/%s' % (obj[:2], obj[2:])
-
-        count=0
-        while count < 5: # repeat if return code is 403
-            count+=1
-            response = self.session.get('%s/%s' % (url, filepath),
-                                    allow_redirects=False,
-                                    timeout=timeout)
-            printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
-
-            if response.status_code != 403:
-                break
-
-        if response.status_code != 200:
-            return []
-
         abspath = os.path.abspath(os.path.join(directory, filepath))
-        create_intermediate_dirs(abspath)
+        # check if file already has been fetched
+        if os.path.exists(abspath):
+            printf('[-] File %s/%s already fetched\n', url, filepath)
+        else:
+            count=0
+            while count < 5: # repeat if return code is 403
+                count+=1
+                response = self.session.get('%s/%s' % (url, filepath),
+                                        allow_redirects=False,
+                                        timeout=timeout)
+                printf('[%d] Fetching %s/%s [%d]\n', count, url, filepath, response.status_code)
 
-        # write file
-        with open(abspath, 'wb') as f:
-            f.write(response.content)
+                if response.status_code == 403:
+                    # start a  new session to drop any cookie, close connection, etc
+                    self.init(url, directory, retry, timeout)
+                    time.sleep(10)
+                    continue
+                else:
+                    break
+
+            if response.status_code != 200:
+                return []
+
+            create_intermediate_dirs(abspath)
+
+            # write file
+            with open(abspath, 'wb') as f:
+                f.write(response.content)
 
         # parse object file to find other objects
         obj_file = dulwich.objects.ShaFile.from_path(abspath)
@@ -320,9 +360,11 @@ def url_get(url):
         printf('[-] Testing %s ', url)
         response = requests.get('%s' % url, verify=False, allow_redirects=False)
         printf('[%d]\n', response.status_code)
-        if response.status_code != 403:
+        if response.status_code == 403:
+            time.sleep(10)
+        else:
             break
-
+    
     return response
 
 
@@ -330,7 +372,7 @@ def fetch_git(url, directory, jobs, retry, timeout):
     ''' Dump a git repository into the output directory '''
 
     assert os.path.isdir(directory), '%s is not a directory' % directory
-    assert not os.listdir(directory), '%s is not empty' % directory
+#    assert not os.listdir(directory), '%s is not empty' % directory
     assert jobs >= 1, 'invalid number of jobs'
     assert retry >= 1, 'invalid number of retries'
     assert timeout >= 1, 'invalid timeout'
@@ -363,10 +405,11 @@ def fetch_git(url, directory, jobs, retry, timeout):
                       RecursiveDownloadWorker,
                       jobs,
                       args=(url, directory, retry, timeout))
-
-        printf('[-] Running git checkout .\n')
-        os.chdir(directory)
-        subprocess.check_call(['git', 'checkout', '.'])
+        
+        # git checkout may delete files (such as .gitignore), so we only remind user to run it if they want.
+        printf('[-] Please run  "git checkout ." in %s\n', directory)
+#        os.chdir(directory)
+#        subprocess.check_call(['git', 'checkout', '.'])
         return 0
 
     # no directory listing
@@ -506,11 +549,12 @@ def fetch_git(url, directory, jobs, retry, timeout):
                   tasks_done=packed_objs)
 
     # git checkout
-    printf('[-] Running git checkout .\n')
-    os.chdir(directory)
+    # it may delete files (such as .gitignore), so we only remind user to run it if they want.
+    printf('[-] Please run "git checkout ." in %s\n', directory)
 
+    # os.chdir(directory)
     # ignore errors
-    subprocess.call(['git', 'checkout', '.'], stderr=open(os.devnull, 'wb'))
+    # subprocess.call(['git', 'checkout', '.'], stderr=open(os.devnull, 'wb'))
 
     return 0
 
@@ -570,8 +614,8 @@ if __name__ == '__main__':
     if not os.path.isdir(args.directory):
         parser.error('%s is not a directory' % args.directory)
 
-    if os.listdir(args.directory):
-        parser.error('%s is not empty' % args.directory)
+#    if os.listdir(args.directory):
+#        parser.error('%s is not empty' % args.directory)
 
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
